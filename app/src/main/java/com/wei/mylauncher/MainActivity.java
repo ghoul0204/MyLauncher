@@ -96,7 +96,12 @@ public class MainActivity extends Activity {
     boolean editMode;
     int pendingWidgetId = -1;
 
-    final ArrayList<String> homeApps = new ArrayList<>();
+    /** 主畫面項目：String = App 的 key；JSONObject = 資料夾 {type:folder, name, apps:[key...]} */
+    final ArrayList<Object> homeItems = new ArrayList<>();
+    View folderPanel;
+    TextView folderTitle;
+    LinearLayout folderGrid;
+    JSONObject openFolder;
     final ArrayList<JSONObject> leftItems = new ArrayList<>();
     final Map<Integer, AppWidgetHostView> widgetViews = new HashMap<>();
     List<App> apps = new ArrayList<>();
@@ -149,6 +154,9 @@ public class MainActivity extends Activity {
         pager.addPage(buildLeftPage());
         pager.addPage(buildHomePage());
         root.addView(pager, new FrameLayout.LayoutParams(MATCH, MATCH));
+        folderPanel = buildFolderPanel();
+        folderPanel.setVisibility(View.GONE);
+        root.addView(folderPanel, new FrameLayout.LayoutParams(MATCH, MATCH));
         drawer = buildDrawer();
         drawer.setVisibility(View.GONE);
         root.addView(drawer, new FrameLayout.LayoutParams(MATCH, MATCH));
@@ -196,6 +204,7 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         boolean wasInFront = hasWindowFocus();
         if (drawer.getVisibility() == View.VISIBLE) closeDrawer();
+        if (folderPanel.getVisibility() == View.VISIBLE) closeFolderPanel();
         if (wasInFront) {               // 已在桌面時再按 Home：回主畫面
             if (editMode) setEditMode(false);
             pager.snapTo(1);
@@ -204,6 +213,7 @@ public class MainActivity extends Activity {
 
     @Override public void onBackPressed() {
         if (drawer.getVisibility() == View.VISIBLE) closeDrawer();
+        else if (folderPanel.getVisibility() == View.VISIBLE) closeFolderPanel();
         else if (editMode) setEditMode(false);
         else pager.snapTo(1);
     }
@@ -213,7 +223,10 @@ public class MainActivity extends Activity {
     void loadState() {
         try {
             JSONArray a = new JSONArray(sp.getString("home", "[]"));
-            for (int i = 0; i < a.length(); i++) homeApps.add(a.getString(i));
+            for (int i = 0; i < a.length(); i++) {
+                Object o = a.get(i);
+                if (o instanceof String || o instanceof JSONObject) homeItems.add(o);
+            }
         } catch (JSONException ignored) { }
         if (!sp.contains("left")) {
             leftItems.add(obj("type", "note", "text",
@@ -229,7 +242,9 @@ public class MainActivity extends Activity {
     void saveState() {
         JSONArray l = new JSONArray();
         for (JSONObject o : leftItems) l.put(o);
-        sp.edit().putString("home", new JSONArray(homeApps).toString())
+        JSONArray h = new JSONArray();
+        for (Object o : homeItems) h.put(o);
+        sp.edit().putString("home", h.toString())
                 .putString("left", l.toString()).apply();
     }
 
@@ -312,6 +327,7 @@ public class MainActivity extends Activity {
         }
         try {
             la.startMainActivity(a.cn, a.user, null, null);
+            if (folderPanel != null && folderPanel.getVisibility() == View.VISIBLE) closeFolderPanel();
         } catch (Exception e) {
             toast("無法開啟 " + a.label);
         }
@@ -349,12 +365,19 @@ public class MainActivity extends Activity {
 
     /** 從 App 抽屜長按出現的選單 */
     void appMenu(final App a) {
-        String[] items = {"加到主畫面", "加到左滑頁（App 捷徑）", "應用程式資訊", "解除安裝"};
+        String[] items = {"加到主畫面", "加到主畫面的資料夾…", "加到左滑頁（App 捷徑）", "應用程式資訊", "解除安裝"};
         new AlertDialog.Builder(this, DLG).setTitle(a.label).setItems(items, (d, w) -> {
             if (w == 0) {
-                if (!homeApps.contains(a.key)) homeApps.add(a.key);
+                if (!homeItems.contains(a.key)) homeItems.add(a.key);
                 saveState(); refreshHome(); toast("已加到主畫面");
             } else if (w == 1) {
+                chooseFolder(f -> {
+                    ArrayList<String> l = appsOf(f);
+                    if (!l.contains(a.key)) l.add(a.key);
+                    put(f, "apps", new JSONArray(l));
+                    saveState(); refreshHome(); toast("已放進「" + f.optString("name") + "」");
+                }, homeItems.size());
+            } else if (w == 2) {
                 JSONObject g = null;
                 for (JSONObject o : leftItems) if ("apps".equals(o.optString("type"))) { g = o; break; }
                 if (g == null) { g = obj("type", "apps", "title", "常用 App", "apps", new JSONArray()); leftItems.add(g); }
@@ -362,7 +385,7 @@ public class MainActivity extends Activity {
                 if (!l.contains(a.key)) l.add(a.key);
                 put(g, "apps", new JSONArray(l));
                 saveState(); refreshLeft(); toast("已加到左滑頁");
-            } else if (w == 2) openAppInfo(a);
+            } else if (w == 3) openAppInfo(a);
             else uninstall(a);
         }).show();
     }
@@ -392,7 +415,7 @@ public class MainActivity extends Activity {
         View spacer = new View(this);
         p.addView(spacer, new LinearLayout.LayoutParams(MATCH, 0, 1f));
 
-        homeHint = text("在「所有應用程式」裡長按 App，可以加到主畫面", 13);
+        homeHint = text("在「所有應用程式」裡長按 App，可以加到主畫面或資料夾", 13);
         homeHint.setGravity(Gravity.CENTER);
         p.addView(homeHint);
 
@@ -421,21 +444,242 @@ public class MainActivity extends Activity {
 
     void refreshHome() {
         homeGrid.removeAllViews();
-        ArrayList<App> list = new ArrayList<>();
-        for (String k : homeApps) { App a = appMap.get(k); if (a != null) list.add(a); }
-        homeHint.setVisibility(homeApps.isEmpty() ? View.VISIBLE : View.GONE);
-        fillGrid(homeGrid, list, 5, a -> homeAppMenu(a));
+        ArrayList<View> cells = new ArrayList<>();
+        for (Object o : homeItems) {
+            if (o instanceof JSONObject) {
+                cells.add(folderCell((JSONObject) o));
+            } else {
+                App a = appMap.get((String) o);
+                if (a != null) cells.add(appCell(a, x -> homeAppMenu(x)));
+            }
+        }
+        homeHint.setVisibility(homeItems.isEmpty() ? View.VISIBLE : View.GONE);
+        fillCells(homeGrid, cells, 5);
+        if (openFolder != null) refreshFolderPanel();
     }
 
     void homeAppMenu(final App a) {
-        String[] items = {"從主畫面移除", "往前移", "往後移", "應用程式資訊"};
+        String[] items = {"放進資料夾…", "從主畫面移除", "往前移", "往後移", "應用程式資訊"};
         new AlertDialog.Builder(this, DLG).setTitle(a.label).setItems(items, (d, w) -> {
-            int i = homeApps.indexOf(a.key);
+            final int i = homeItems.indexOf(a.key);
             if (i < 0) return;
-            if (w == 0) homeApps.remove(i);
-            else if (w == 1 && i > 0) Collections.swap(homeApps, i, i - 1);
-            else if (w == 2 && i < homeApps.size() - 1) Collections.swap(homeApps, i, i + 1);
-            else if (w == 3) { openAppInfo(a); return; }
+            if (w == 0) {
+                chooseFolder(f -> {
+                    homeItems.remove(a.key);
+                    ArrayList<String> l = appsOf(f);
+                    if (!l.contains(a.key)) l.add(a.key);
+                    put(f, "apps", new JSONArray(l));
+                    saveState(); refreshHome();
+                }, i);
+                return;
+            }
+            if (w == 1) homeItems.remove(i);
+            else if (w == 2 && i > 0) Collections.swap(homeItems, i, i - 1);
+            else if (w == 3 && i < homeItems.size() - 1) Collections.swap(homeItems, i, i + 1);
+            else if (w == 4) { openAppInfo(a); return; }
+            saveState(); refreshHome();
+        }).show();
+    }
+
+    // ───────────────────────── 資料夾 ─────────────────────────
+
+    interface FolderAction { void run(JSONObject folder); }
+
+    /** 選一個現有資料夾，或建立新資料夾（新資料夾放在主畫面第 insertAt 個位置） */
+    void chooseFolder(final FolderAction then, final int insertAt) {
+        final ArrayList<JSONObject> folders = new ArrayList<>();
+        for (Object o : homeItems) if (o instanceof JSONObject) folders.add((JSONObject) o);
+        String[] names = new String[folders.size() + 1];
+        for (int i = 0; i < folders.size(); i++) names[i] = "📁 " + folders.get(i).optString("name");
+        names[folders.size()] = "＋ 新資料夾…";
+        new AlertDialog.Builder(this, DLG).setTitle("放進哪個資料夾？").setItems(names, (d, w) -> {
+            if (w < folders.size()) { then.run(folders.get(w)); return; }
+            askName("新資料夾名稱", "", name -> {
+                JSONObject f = obj("type", "folder", "name", name, "apps", new JSONArray());
+                homeItems.add(Math.max(0, Math.min(insertAt, homeItems.size())), f);
+                then.run(f);
+            });
+        }).show();
+    }
+
+    interface NameAction { void run(String name); }
+
+    void askName(String title, String current, final NameAction then) {
+        final EditText et = new EditText(this);
+        et.setText(current);
+        et.setHint("例如：工作、社群、影音、工具");
+        et.setSingleLine();
+        et.setSelection(et.getText().length());
+        new AlertDialog.Builder(this, DLG).setTitle(title).setView(et)
+                .setPositiveButton("確定", (d, w) -> {
+                    String n = et.getText().toString().trim();
+                    then.run(n.isEmpty() ? "資料夾" : n);
+                })
+                .setNegativeButton("取消", null).show();
+    }
+
+    /** 資料夾圖示：最多顯示前 4 個 App 的小圖 */
+    View folderCell(final JSONObject f) {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setGravity(Gravity.CENTER_HORIZONTAL);
+        v.setPadding(dp(2), dp(4), dp(2), dp(4));
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setPadding(dp(4), dp(4), dp(4), dp(4));
+        box.setBackground(round(0x55FFFFFF, 14));
+        ArrayList<String> keys = appsOf(f);
+        ArrayList<App> shown = new ArrayList<>();
+        for (String k : keys) { App a = appMap.get(k); if (a != null) shown.add(a); if (shown.size() == 4) break; }
+        for (int r = 0; r < 2; r++) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            for (int c = 0; c < 2; c++) {
+                ImageView iv = new ImageView(this);
+                int idx = r * 2 + c;
+                if (idx < shown.size()) iv.setImageDrawable(shown.get(idx).icon);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(18), dp(18));
+                lp.setMargins(dp(1), dp(1), dp(1), dp(1));
+                row.addView(iv, lp);
+            }
+            box.addView(row);
+        }
+        v.addView(box, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        TextView t = text(f.optString("name"), 12);
+        t.setSingleLine();
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(0, dp(4), 0, 0);
+        v.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        v.setOnClickListener(x -> openFolderPanel(f));
+        v.setOnLongClickListener(x -> { folderMenu(f); return true; });
+        return v;
+    }
+
+    void folderMenu(final JSONObject f) {
+        String[] items = {"打開", "重新命名", "往前移", "往後移", "解散（App 放回主畫面）", "刪除資料夾"};
+        new AlertDialog.Builder(this, DLG).setTitle("📁 " + f.optString("name")).setItems(items, (d, w) -> {
+            int i = homeItems.indexOf(f);
+            if (i < 0) return;
+            if (w == 0) { openFolderPanel(f); return; }
+            if (w == 1) { askName("重新命名", f.optString("name"), n -> { put(f, "name", n); saveState(); refreshHome(); }); return; }
+            if (w == 2 && i > 0) Collections.swap(homeItems, i, i - 1);
+            else if (w == 3 && i < homeItems.size() - 1) Collections.swap(homeItems, i, i + 1);
+            else if (w == 4) {
+                homeItems.remove(i);
+                int pos = i;
+                for (String k : appsOf(f)) if (!homeItems.contains(k)) homeItems.add(pos++, k);
+            } else if (w == 5) {
+                new AlertDialog.Builder(this, DLG)
+                        .setMessage("刪除資料夾「" + f.optString("name") + "」？\n（只會移除桌面上的捷徑，App 本身不會被刪除）")
+                        .setPositiveButton("刪除", (d2, w2) -> { homeItems.remove(f); saveState(); refreshHome(); })
+                        .setNegativeButton("取消", null).show();
+                return;
+            }
+            saveState(); refreshHome();
+        }).show();
+    }
+
+    View buildFolderPanel() {
+        FrameLayout dim = new FrameLayout(this);
+        dim.setBackgroundColor(0x99000000);
+        dim.setOnClickListener(v -> closeFolderPanel());
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(16), dp(16), dp(12));
+        card.setBackground(round(0xF0202124, 24));
+        card.setClickable(true);   // 點卡片本身不會關閉
+
+        folderTitle = text("", 20);
+        folderTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        folderTitle.setGravity(Gravity.CENTER);
+        folderTitle.setPadding(0, 0, 0, dp(12));
+        folderTitle.setOnClickListener(v -> {
+            final JSONObject f = openFolder;
+            if (f != null) askName("重新命名", f.optString("name"), n -> { put(f, "name", n); saveState(); refreshHome(); });
+        });
+        card.addView(folderTitle);
+
+        ScrollView sv = new ScrollView(this);
+        folderGrid = new LinearLayout(this);
+        folderGrid.setOrientation(LinearLayout.VERTICAL);
+        sv.addView(folderGrid, new FrameLayout.LayoutParams(MATCH, WRAP));
+        card.addView(sv, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        LinearLayout btns = new LinearLayout(this);
+        btns.setOrientation(LinearLayout.HORIZONTAL);
+        btns.setGravity(Gravity.CENTER);
+        btns.setPadding(0, dp(12), 0, 0);
+        btns.addView(smallBtn("＋ 加入 App", v -> {
+            final JSONObject f = openFolder;
+            if (f == null) return;
+            openDrawer(a -> {
+                ArrayList<String> l = appsOf(f);
+                if (!l.contains(a.key)) l.add(a.key);
+                put(f, "apps", new JSONArray(l));
+                homeItems.remove(a.key);   // 原本在主畫面上的就搬進來
+                saveState(); refreshHome();
+            });
+        }));
+        btns.addView(smallBtn("關閉", v -> closeFolderPanel()));
+        card.addView(btns);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER);
+        lp.setMargins(dp(20), dp(40), dp(20), dp(40));
+        dim.addView(card, lp);
+        return dim;
+    }
+
+    void openFolderPanel(JSONObject f) {
+        openFolder = f;
+        refreshFolderPanel();
+        folderPanel.setVisibility(View.VISIBLE);
+    }
+
+    void closeFolderPanel() {
+        openFolder = null;
+        folderPanel.setVisibility(View.GONE);
+    }
+
+    void refreshFolderPanel() {
+        final JSONObject f = openFolder;
+        if (f == null) return;
+        if (!homeItems.contains(f)) { closeFolderPanel(); return; }
+        folderTitle.setText(f.optString("name") + "  ✎");
+        folderGrid.removeAllViews();
+        ArrayList<View> cells = new ArrayList<>();
+        for (String k : appsOf(f)) {
+            App a = appMap.get(k);
+            if (a != null) cells.add(appCell(a, x -> folderAppMenu(f, x)));
+        }
+        if (cells.isEmpty()) {
+            TextView e = text("資料夾是空的，按下方「＋ 加入 App」", 13);
+            e.setGravity(Gravity.CENTER);
+            folderGrid.addView(e, new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        fillCells(folderGrid, cells, 4);
+    }
+
+    void folderAppMenu(final JSONObject f, final App a) {
+        String[] items = {"移到主畫面", "從資料夾移除", "往前移", "往後移", "應用程式資訊"};
+        new AlertDialog.Builder(this, DLG).setTitle(a.label).setItems(items, (d, w) -> {
+            ArrayList<String> l = appsOf(f);
+            int i = l.indexOf(a.key);
+            if (i < 0) return;
+            if (w == 0) {
+                l.remove(i);
+                int pos = homeItems.indexOf(f) + 1;
+                if (!homeItems.contains(a.key)) homeItems.add(pos, a.key);
+            } else if (w == 1) l.remove(i);
+            else if (w == 2 && i > 0) Collections.swap(l, i, i - 1);
+            else if (w == 3 && i < l.size() - 1) Collections.swap(l, i, i + 1);
+            else if (w == 4) { openAppInfo(a); return; }
+            put(f, "apps", new JSONArray(l));
             saveState(); refreshHome();
         }).show();
     }
@@ -900,25 +1144,34 @@ public class MainActivity extends Activity {
         return v;
     }
 
+    View appCell(final App a, final AppAction onLong) {
+        LinearLayout cell = iconCell();
+        ((ImageView) cell.getChildAt(0)).setImageDrawable(a.icon);
+        ((TextView) cell.getChildAt(1)).setText(a.label);
+        cell.setAlpha(a.work && workQuiet ? 0.4f : 1f);
+        cell.setOnClickListener(v -> launch(a));
+        cell.setOnLongClickListener(v -> { onLong.run(a); return true; });
+        return cell;
+    }
+
     void fillGrid(LinearLayout container, List<App> list, int cols, final AppAction onLong) {
+        ArrayList<View> cells = new ArrayList<>();
+        for (App a : list) cells.add(appCell(a, onLong));
+        fillCells(container, cells, cols);
+    }
+
+    void fillCells(LinearLayout container, List<View> cells, int cols) {
         LinearLayout row = null;
-        for (int i = 0; i < list.size(); i++) {
+        for (int i = 0; i < cells.size(); i++) {
             if (i % cols == 0) {
                 row = new LinearLayout(this);
                 row.setOrientation(LinearLayout.HORIZONTAL);
                 container.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
             }
-            final App a = list.get(i);
-            LinearLayout cell = iconCell();
-            ((ImageView) cell.getChildAt(0)).setImageDrawable(a.icon);
-            ((TextView) cell.getChildAt(1)).setText(a.label);
-            cell.setAlpha(a.work && workQuiet ? 0.4f : 1f);
-            cell.setOnClickListener(v -> launch(a));
-            cell.setOnLongClickListener(v -> { onLong.run(a); return true; });
-            row.addView(cell, new LinearLayout.LayoutParams(0, WRAP, 1f));
+            row.addView(cells.get(i), new LinearLayout.LayoutParams(0, WRAP, 1f));
         }
         if (row != null) {
-            int rem = list.size() % cols;
+            int rem = cells.size() % cols;
             if (rem != 0) for (int k = rem; k < cols; k++)
                 row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
         }
