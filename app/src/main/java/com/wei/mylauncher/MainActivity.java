@@ -12,8 +12,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.LauncherActivityInfo;
+import android.content.pm.LauncherApps;
 import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Process;
+import android.os.UserHandle;
+import android.os.UserManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -70,6 +76,8 @@ public class MainActivity extends Activity {
         String key, label;
         ComponentName cn;
         Drawable icon;
+        UserHandle user;
+        boolean work;
     }
 
     interface Pick { void picked(App a); }
@@ -95,8 +103,24 @@ public class MainActivity extends Activity {
     final Map<String, App> appMap = new HashMap<>();
     final ExecutorService bg = Executors.newSingleThreadExecutor();
 
-    final BroadcastReceiver pkgRx = new BroadcastReceiver() {
+    LauncherApps la;
+    UserManager um;
+    UserHandle workUser;          // Shelter / 公司的工作資料夾
+    boolean workQuiet;            // 工作資料夾是否已暫停
+    boolean showWork;             // App 抽屜目前在「工作」分頁
+    TextView tabPersonal, tabWork, workToggle;
+    View tabsRow;
+
+    final BroadcastReceiver profileRx = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { reloadApps(); }
+    };
+
+    final LauncherApps.Callback appsCb = new LauncherApps.Callback() {
+        @Override public void onPackageRemoved(String p, UserHandle u) { reloadApps(); }
+        @Override public void onPackageAdded(String p, UserHandle u) { reloadApps(); }
+        @Override public void onPackageChanged(String p, UserHandle u) { reloadApps(); }
+        @Override public void onPackagesAvailable(String[] p, UserHandle u, boolean r) { reloadApps(); }
+        @Override public void onPackagesUnavailable(String[] p, UserHandle u, boolean r) { reloadApps(); }
     };
 
     // ───────────────────────── 生命週期 ─────────────────────────
@@ -113,6 +137,8 @@ public class MainActivity extends Activity {
 
         sp = getSharedPreferences("launcher", MODE_PRIVATE);
         awm = AppWidgetManager.getInstance(this);
+        la = (LauncherApps) getSystemService(Context.LAUNCHER_APPS_SERVICE);
+        um = (UserManager) getSystemService(Context.USER_SERVICE);
         host = new AppWidgetHost(this, HOST_ID);
         if (b != null) pendingWidgetId = b.getInt("pending", -1);
         loadState();
@@ -133,13 +159,15 @@ public class MainActivity extends Activity {
         refreshLeft();
         reloadApps();
 
+        la.registerCallback(appsCb, new Handler(Looper.getMainLooper()));
         IntentFilter f = new IntentFilter();
-        f.addAction(Intent.ACTION_PACKAGE_ADDED);
-        f.addAction(Intent.ACTION_PACKAGE_REMOVED);
-        f.addAction(Intent.ACTION_PACKAGE_CHANGED);
-        f.addDataScheme("package");
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(pkgRx, f, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(pkgRx, f);
+        f.addAction(Intent.ACTION_MANAGED_PROFILE_ADDED);
+        f.addAction(Intent.ACTION_MANAGED_PROFILE_REMOVED);
+        f.addAction(Intent.ACTION_MANAGED_PROFILE_AVAILABLE);
+        f.addAction(Intent.ACTION_MANAGED_PROFILE_UNAVAILABLE);
+        f.addAction(Intent.ACTION_MANAGED_PROFILE_UNLOCKED);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(profileRx, f, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(profileRx, f);
     }
 
     @Override protected void onStart() {
@@ -154,7 +182,8 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         super.onDestroy();
-        try { unregisterReceiver(pkgRx); } catch (Exception ignored) { }
+        try { unregisterReceiver(profileRx); } catch (Exception ignored) { }
+        try { la.unregisterCallback(appsCb); } catch (Exception ignored) { }
         bg.shutdown();
     }
 
@@ -226,23 +255,44 @@ public class MainActivity extends Activity {
 
     void reloadApps() {
         bg.execute(() -> {
-            PackageManager pm = getPackageManager();
-            Intent i = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-            List<ResolveInfo> ris = pm.queryIntentActivities(i, 0);
             final ArrayList<App> list = new ArrayList<>();
-            for (ResolveInfo r : ris) {
-                if (r.activityInfo.packageName.equals(getPackageName())) continue;
-                App a = new App();
-                a.cn = new ComponentName(r.activityInfo.packageName, r.activityInfo.name);
-                a.key = a.cn.flattenToString();
-                a.label = String.valueOf(r.loadLabel(pm));
-                a.icon = r.loadIcon(pm);
-                list.add(a);
+            UserHandle me = Process.myUserHandle();
+            UserHandle wu = null;
+            boolean wq = false;
+            List<UserHandle> profiles;
+            try { profiles = la.getProfiles(); } catch (Exception e) { profiles = Collections.singletonList(me); }
+            for (UserHandle u : profiles) {
+                boolean work = !u.equals(me);
+                long serial = um.getSerialNumberForUser(u);
+                if (work) {
+                    wu = u;
+                    try { wq = um.isQuietModeEnabled(u); } catch (Exception ignored) { }
+                }
+                List<LauncherActivityInfo> infos;
+                try { infos = la.getActivityList(null, u); } catch (Exception e) { continue; }
+                for (LauncherActivityInfo li : infos) {
+                    if (!work && li.getComponentName().getPackageName().equals(getPackageName())) continue;
+                    App a = new App();
+                    a.cn = li.getComponentName();
+                    a.user = u;
+                    a.work = work;
+                    // 個人 App 的 key 維持舊格式，工作 App 加上使用者序號區分
+                    a.key = work ? a.cn.flattenToString() + "#" + serial : a.cn.flattenToString();
+                    a.label = String.valueOf(li.getLabel());
+                    try { a.icon = li.getBadgedIcon(0); } catch (Exception e) { a.icon = li.getIcon(0); }
+                    list.add(a);
+                }
             }
             final Collator col = Collator.getInstance(Locale.TAIWAN);
             Collections.sort(list, (x, y) -> col.compare(x.label, y.label));
+            final UserHandle fwu = wu;
+            final boolean fwq = wq;
             runOnUiThread(() -> {
                 if (isDestroyed()) return;
+                workUser = fwu;
+                workQuiet = fwq;
+                if (workUser == null) showWork = false;
+                updateTabs();
                 apps = list;
                 appMap.clear();
                 for (App a : list) appMap.put(a.key, a);
@@ -254,28 +304,47 @@ public class MainActivity extends Activity {
     }
 
     void launch(App a) {
+        if (a.work && workQuiet) {
+            new AlertDialog.Builder(this, DLG).setMessage("工作應用程式目前已暫停，要開啟嗎？")
+                    .setPositiveButton("開啟", (d, w) -> setWorkPaused(false))
+                    .setNegativeButton("取消", null).show();
+            return;
+        }
         try {
-            Intent i = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-                    .setComponent(a.cn)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            startActivity(i);
+            la.startMainActivity(a.cn, a.user, null, null);
         } catch (Exception e) {
             toast("無法開啟 " + a.label);
         }
     }
 
     void openAppInfo(App a) {
-        try {
-            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.fromParts("package", a.cn.getPackageName(), null)));
-        } catch (Exception ignored) { }
+        try { la.startAppDetailsActivity(a.cn, a.user, null, null); }
+        catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", a.cn.getPackageName(), null)));
+            } catch (Exception ignored) { }
+        }
     }
 
     void uninstall(App a) {
         try {
-            startActivity(new Intent(Intent.ACTION_DELETE,
-                    Uri.fromParts("package", a.cn.getPackageName(), null)));
+            Intent i = new Intent(Intent.ACTION_DELETE,
+                    Uri.fromParts("package", a.cn.getPackageName(), null));
+            i.putExtra(Intent.EXTRA_USER, a.user);
+            startActivity(i);
         } catch (Exception ignored) { }
+    }
+
+    /** 暫停／開啟工作資料夾（需要「我的桌面」是預設桌面，Android 9 以上） */
+    void setWorkPaused(boolean pause) {
+        if (workUser == null) return;
+        if (Build.VERSION.SDK_INT < 28) { toast("這個功能需要 Android 9 以上"); return; }
+        try {
+            um.requestQuietModeEnabled(pause, workUser);
+        } catch (Exception e) {
+            toast("無法切換，請先把「我的桌面」設為預設桌面");
+        }
     }
 
     /** 從 App 抽屜長按出現的選單 */
@@ -599,19 +668,28 @@ public class MainActivity extends Activity {
 
     void showWidgetPicker() {
         final PackageManager pm = getPackageManager();
-        List<AppWidgetProviderInfo> all = awm.getInstalledProviders();
-        if (all == null || all.isEmpty()) { toast("找不到可用的小工具"); return; }
         final ArrayList<AppWidgetProviderInfo> ps = new ArrayList<>();
         final Map<AppWidgetProviderInfo, String> names = new HashMap<>();
-        for (AppWidgetProviderInfo info : all) {
-            String pkg = info.provider.getPackageName();
-            String app;
-            try { app = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString(); }
-            catch (Exception e) { app = pkg; }
-            String wl = String.valueOf(info.loadLabel(pm));
-            names.put(info, app.equals(wl) ? app : app + "・" + wl);
-            ps.add(info);
+        UserHandle me = Process.myUserHandle();
+        List<UserHandle> profiles;
+        try { profiles = la.getProfiles(); } catch (Exception e) { profiles = Collections.singletonList(me); }
+        for (UserHandle u : profiles) {
+            boolean work = !u.equals(me);
+            List<AppWidgetProviderInfo> all;
+            try { all = awm.getInstalledProvidersForProfile(u); } catch (Exception e) { continue; }
+            if (all == null) continue;
+            for (AppWidgetProviderInfo info : all) {
+                String pkg = info.provider.getPackageName();
+                String app;
+                try { app = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString(); }
+                catch (Exception e) { app = pkg; }
+                String wl = String.valueOf(info.loadLabel(pm));
+                String name = app.equals(wl) ? app : app + "・" + wl;
+                names.put(info, work ? "【工作】" + name : name);
+                ps.add(info);
+            }
         }
+        if (ps.isEmpty()) { toast("找不到可用的小工具"); return; }
         final Collator col = Collator.getInstance(Locale.TAIWAN);
         Collections.sort(ps, (x, y) -> col.compare(names.get(x), names.get(y)));
         String[] arr = new String[ps.size()];
@@ -685,6 +763,22 @@ public class MainActivity extends Activity {
         drawerTitle.setPadding(dp(4), 0, 0, dp(8));
         d.addView(drawerTitle);
 
+        // 個人／工作分頁（有 Shelter 等工作資料夾時才出現）
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setGravity(Gravity.CENTER_VERTICAL);
+        tabs.setPadding(0, 0, 0, dp(10));
+        tabPersonal = smallBtn("個人", v -> { showWork = false; updateTabs(); drawerAdapter.filter(drawerSearch.getText().toString()); });
+        tabWork = smallBtn("工作", v -> { showWork = true; updateTabs(); drawerAdapter.filter(drawerSearch.getText().toString()); });
+        tabs.addView(tabPersonal);
+        tabs.addView(tabWork);
+        View tsp = new View(this);
+        tabs.addView(tsp, new LinearLayout.LayoutParams(0, 1, 1f));
+        workToggle = smallBtn("", v -> setWorkPaused(!workQuiet));
+        tabs.addView(workToggle);
+        tabsRow = tabs;
+        d.addView(tabs);
+
         drawerSearch = new EditText(this);
         drawerSearch.setHint("搜尋 App");
         drawerSearch.setSingleLine();
@@ -721,6 +815,15 @@ public class MainActivity extends Activity {
         return d;
     }
 
+    void updateTabs() {
+        if (tabsRow == null) return;
+        tabsRow.setVisibility(workUser != null ? View.VISIBLE : View.GONE);
+        tabPersonal.setBackground(round(showWork ? 0x22FFFFFF : 0x88FFFFFF, 12));
+        tabWork.setBackground(round(showWork ? 0x88FFFFFF : 0x22FFFFFF, 12));
+        workToggle.setVisibility(showWork ? View.VISIBLE : View.GONE);
+        workToggle.setText(workQuiet ? "▶ 開啟工作 App" : "⏸ 暫停工作 App");
+    }
+
     void onDrawerTap(App a) {
         if (pick != null) {
             Pick p = pick;
@@ -753,7 +856,9 @@ public class MainActivity extends Activity {
         void filter(String q) {
             String s = q.trim().toLowerCase(Locale.ROOT);
             ArrayList<App> l = new ArrayList<>();
+            boolean onlyWork = showWork && workUser != null;
             for (App a : apps)
+                if (a.work == onlyWork)
                 if (s.isEmpty() || a.label.toLowerCase(Locale.ROOT).contains(s)
                         || a.cn.getPackageName().toLowerCase(Locale.ROOT).contains(s)) l.add(a);
             shown = l;
@@ -770,6 +875,7 @@ public class MainActivity extends Activity {
             App a = shown.get(pos);
             ((ImageView) v.getChildAt(0)).setImageDrawable(a.icon);
             ((TextView) v.getChildAt(1)).setText(a.label);
+            v.setAlpha(a.work && workQuiet ? 0.4f : 1f);
             return v;
         }
     }
@@ -806,6 +912,7 @@ public class MainActivity extends Activity {
             LinearLayout cell = iconCell();
             ((ImageView) cell.getChildAt(0)).setImageDrawable(a.icon);
             ((TextView) cell.getChildAt(1)).setText(a.label);
+            cell.setAlpha(a.work && workQuiet ? 0.4f : 1f);
             cell.setOnClickListener(v -> launch(a));
             cell.setOnLongClickListener(v -> { onLong.run(a); return true; });
             row.addView(cell, new LinearLayout.LayoutParams(0, WRAP, 1f));

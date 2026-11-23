@@ -10,8 +10,8 @@ android {
         applicationId 'com.wei.mylauncher'
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
     }
 
     // 固定簽章：每次編出來的 APK 都能直接覆蓋安裝，設定不會遺失
