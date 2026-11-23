@@ -1,7 +1,11 @@
 package com.wei.mylauncher;
 
 import android.app.Activity;
+import android.app.ActivityOptions;
 import android.app.AlertDialog;
+import android.app.PendingIntent;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.appwidget.AppWidgetHost;
 import android.appwidget.AppWidgetHostView;
 import android.appwidget.AppWidgetManager;
@@ -56,6 +60,8 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.text.Collator;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -95,6 +101,12 @@ public class MainActivity extends Activity {
     Pick pick;
     boolean editMode;
     int pendingWidgetId = -1;
+
+    // LINE 訊息區塊
+    LinearLayout lineList;
+    String lineChat;              // null = 全部聊天室
+    int lineLimit = 40;
+    boolean lastListenerOk;
 
     /** 主畫面項目：String = App 的 key；JSONObject = 資料夾 {type:folder, name, apps:[key...]} */
     final ArrayList<Object> homeItems = new ArrayList<>();
@@ -181,6 +193,14 @@ public class MainActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         try { host.startListening(); } catch (Exception ignored) { }
+        LineListener.onNew = () -> { if (lineList != null) fillLineList(); };
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        boolean ok = listenerEnabled();
+        if (ok != lastListenerOk) { lastListenerOk = ok; refreshLeft(); }   // 剛開好通知存取權 → 拿掉提示
+        else if (lineList != null) fillLineList();
     }
 
     @Override protected void onStop() {
@@ -190,6 +210,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         super.onDestroy();
+        LineListener.onNew = null;
         try { unregisterReceiver(profileRx); } catch (Exception ignored) { }
         try { la.unregisterCallback(appsCb); } catch (Exception ignored) { }
         bg.shutdown();
@@ -231,12 +252,18 @@ public class MainActivity extends Activity {
         if (!sp.contains("left")) {
             leftItems.add(obj("type", "note", "text",
                     "這是你的左滑頁。\n按右上「編輯」可調整，按下方「＋ 新增項目」加入小工具、App 捷徑或便條。"));
-            return;
+        } else {
+            try {
+                JSONArray a = new JSONArray(sp.getString("left", "[]"));
+                for (int i = 0; i < a.length(); i++) leftItems.add(a.getJSONObject(i));
+            } catch (JSONException ignored) { }
         }
-        try {
-            JSONArray a = new JSONArray(sp.getString("left", "[]"));
-            for (int i = 0; i < a.length(); i++) leftItems.add(a.getJSONObject(i));
-        } catch (JSONException ignored) { }
+        // 第一次更新到有 LINE 功能的版本：自動把「LINE 訊息」放在左滑頁最上面
+        if (!sp.getBoolean("line_added", false)) {
+            leftItems.add(0, obj("type", "line"));
+            sp.edit().putBoolean("line_added", true).apply();
+            saveState();
+        }
     }
 
     void saveState() {
@@ -742,6 +769,7 @@ public class MainActivity extends Activity {
     void refreshLeft() {
         editBtn.setText(editMode ? "完成" : "編輯");
         leftList.removeAllViews();
+        lineList = null;
         for (int i = 0; i < leftItems.size(); i++) {
             final JSONObject it = leftItems.get(i);
             String type = it.optString("type");
@@ -770,6 +798,8 @@ public class MainActivity extends Activity {
                 grid.setOrientation(LinearLayout.VERTICAL);
                 fillGrid(grid, list, 5, a -> groupAppMenu(it, a));
                 card.addView(grid);
+            } else if ("line".equals(type)) {
+                card.addView(lineCard());
             } else if ("note".equals(type)) {
                 EditText et = new EditText(this);
                 et.setText(it.optString("text"));
@@ -870,9 +900,13 @@ public class MainActivity extends Activity {
     }
 
     void addItemMenu() {
-        String[] items = {"Android 小工具（行事曆、天氣、記事…）", "App 捷徑組", "便條"};
+        String[] items = {"Android 小工具（行事曆、天氣、記事…）", "App 捷徑組", "便條", "LINE 訊息"};
         new AlertDialog.Builder(this, DLG).setTitle("新增到左滑頁").setItems(items, (d, w) -> {
             if (w == 0) showWidgetPicker();
+            else if (w == 3) {
+                leftItems.add(0, obj("type", "line"));
+                saveState(); refreshLeft();
+            }
             else if (w == 1) {
                 final JSONObject g = obj("type", "apps", "title", "常用 App", "apps", new JSONArray());
                 leftItems.add(g);
@@ -888,6 +922,187 @@ public class MainActivity extends Activity {
                 saveState(); refreshLeft();
             }
         }).show();
+    }
+
+    // ───────────────────────── LINE 訊息 ─────────────────────────
+
+    boolean listenerEnabled() {
+        String s = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+        return s != null && s.contains(getPackageName() + "/");
+    }
+
+    void openListenerSettings() {
+        Intent i;
+        if (Build.VERSION.SDK_INT >= 30) {
+            i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS);
+            i.putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                    new ComponentName(this, LineListener.class).flattenToString());
+        } else {
+            i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+        }
+        try { startActivity(i); }
+        catch (Exception e) {
+            try { startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); } catch (Exception ignored) { }
+        }
+    }
+
+    View lineCard() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView t = text("LINE 訊息", 16);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        header.addView(t, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        header.addView(smallBtn(lineChat == null ? "全部聊天室 ▾" : lineChat + " ▾", v -> chooseLineChat()));
+        header.addView(smallBtn("⋯", v -> lineMenu()));
+        box.addView(header);
+
+        if (!listenerEnabled()) {
+            TextView w = text("還沒開啟通知存取權，LINE 訊息不會被記錄。\n"
+                    + "按下面按鈕，把「我的桌面」打開。如果開關是灰色按不動：到「應用程式資訊」→ 右上角 ⋮ →「允許受限制的設定」，再回來打開。", 13);
+            w.setTextColor(0xFFFFD27F);
+            w.setPadding(0, dp(8), 0, dp(6));
+            box.addView(w);
+            LinearLayout b = new LinearLayout(this);
+            b.addView(smallBtn("前往開啟", v -> openListenerSettings()));
+            b.addView(smallBtn("應用程式資訊", v -> {
+                try {
+                    startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", getPackageName(), null)));
+                } catch (Exception ignored) { }
+            }));
+            box.addView(b);
+        }
+
+        lineList = new LinearLayout(this);
+        lineList.setOrientation(LinearLayout.VERTICAL);
+        lineList.setPadding(0, dp(6), 0, 0);
+        box.addView(lineList, new LinearLayout.LayoutParams(MATCH, WRAP));
+        fillLineList();
+        return box;
+    }
+
+    void fillLineList() {
+        if (lineList == null) return;
+        lineList.removeAllViews();
+        List<LineStore.Msg> ms = LineStore.get(this).recent(lineChat, lineLimit);
+        if (ms.isEmpty()) {
+            TextView e = text(lineChat == null ? "還沒有訊息。之後收到的 LINE 會一則一則出現在這裡。" : "這個聊天室沒有紀錄。", 13);
+            e.setTextColor(0xAAFFFFFF);
+            e.setPadding(0, dp(6), 0, dp(6));
+            lineList.addView(e);
+            return;
+        }
+        SimpleDateFormat today = new SimpleDateFormat("HH:mm", Locale.TAIWAN);
+        SimpleDateFormat other = new SimpleDateFormat("M/d HH:mm", Locale.TAIWAN);
+        String todayStr = new SimpleDateFormat("yyyyMMdd", Locale.US).format(new Date());
+        SimpleDateFormat dayKey = new SimpleDateFormat("yyyyMMdd", Locale.US);
+        for (final LineStore.Msg m : ms) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(8), dp(6), dp(8), dp(6));
+            row.setBackground(round(0x14FFFFFF, 10));
+
+            Date d = new Date(m.time);
+            String when = (todayStr.equals(dayKey.format(d)) ? today : other).format(d);
+            StringBuilder meta = new StringBuilder();
+            if (lineChat == null) meta.append(m.chat);
+            if (!m.sender.equals(m.chat)) meta.append(meta.length() > 0 ? "・" : "").append(m.sender);
+            if (m.work) meta.append(" 💼");
+            meta.append("   ").append(when);
+            TextView mt = text(meta.toString(), 12);
+            mt.setTextColor(0xAAFFFFFF);
+            row.addView(mt);
+
+            TextView body = text(m.body, 15);
+            body.setPadding(0, dp(2), 0, 0);
+            row.addView(body);
+
+            row.setOnClickListener(v -> openLineChat(m.chat));
+            row.setOnLongClickListener(v -> { lineMsgMenu(m); return true; });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            lp.bottomMargin = dp(6);
+            lineList.addView(row, lp);
+        }
+        if (ms.size() >= lineLimit) {
+            TextView more = smallBtn("顯示更多", v -> { lineLimit += 50; fillLineList(); });
+            lineList.addView(more);
+        }
+    }
+
+    void chooseLineChat() {
+        final List<String[]> chats = LineStore.get(this).chats();
+        String[] names = new String[chats.size() + 1];
+        names[0] = "全部聊天室";
+        for (int i = 0; i < chats.size(); i++) names[i + 1] = chats.get(i)[0] + "（" + chats.get(i)[1] + "）";
+        new AlertDialog.Builder(this, DLG).setTitle("選擇聊天室").setItems(names, (d, w) -> {
+            lineChat = w == 0 ? null : chats.get(w - 1)[0];
+            lineLimit = 40;
+            refreshLeft();
+        }).show();
+    }
+
+    void lineMsgMenu(final LineStore.Msg m) {
+        String[] items = {"複製文字", "只看「" + m.chat + "」", "刪除這則"};
+        new AlertDialog.Builder(this, DLG).setItems(items, (d, w) -> {
+            if (w == 0) {
+                ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("LINE", m.body));
+                toast("已複製");
+            } else if (w == 1) {
+                lineChat = m.chat; lineLimit = 40; refreshLeft();
+            } else {
+                LineStore.get(this).delete(m.id); fillLineList();
+            }
+        }).show();
+    }
+
+    void lineMenu() {
+        String[] items = {"通知存取權設定", "診斷資訊（複製給 Claude）", "清除全部 LINE 紀錄"};
+        new AlertDialog.Builder(this, DLG).setItems(items, (d, w) -> {
+            if (w == 0) openListenerSettings();
+            else if (w == 1) {
+                StringBuilder sb = new StringBuilder();
+                synchronized (LineListener.diag) { for (String s : LineListener.diag) sb.append(s).append("\n"); }
+                final String txt = sb.length() == 0 ? "（目前沒有資料：收到幾則 LINE 之後再看）" : sb.toString();
+                new AlertDialog.Builder(this, DLG).setTitle("最近的 LINE 通知原始內容").setMessage(txt)
+                        .setPositiveButton("複製", (d2, w2) -> {
+                            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("diag", txt));
+                            toast("已複製");
+                        })
+                        .setNegativeButton("關閉", null).show();
+            } else {
+                new AlertDialog.Builder(this, DLG).setMessage("清除全部 LINE 紀錄？無法復原。")
+                        .setPositiveButton("清除", (d2, w2) -> { LineStore.get(this).clear(); lineChat = null; refreshLeft(); })
+                        .setNegativeButton("取消", null).show();
+            }
+        }).show();
+    }
+
+    /** 點訊息：盡量直接打開那個聊天室，不行就打開 LINE */
+    void openLineChat(String chat) {
+        PendingIntent pi = LineListener.chatIntents.get(chat);
+        if (pi != null) {
+            try {
+                if (Build.VERSION.SDK_INT >= 34) {
+                    ActivityOptions o = ActivityOptions.makeBasic();
+                    o.setPendingIntentBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED);
+                    pi.send(this, 0, null, null, null, null, o.toBundle());
+                } else {
+                    pi.send();
+                }
+                return;
+            } catch (Exception ignored) { }
+        }
+        Intent i = getPackageManager().getLaunchIntentForPackage(LineListener.LINE);
+        if (i != null) {
+            try { startActivity(i); return; } catch (Exception ignored) { }
+        }
+        toast("找不到 LINE");
     }
 
     // ───────────────────────── Android 小工具 ─────────────────────────

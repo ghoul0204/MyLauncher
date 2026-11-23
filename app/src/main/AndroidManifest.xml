@@ -9,6 +9,7 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <package android:name="jp.naver.line.android" />
     </queries>
 
     <application
@@ -39,5 +40,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 讀取 LINE 通知，把每則訊息記下來 -->
+        <service
+            android:name=".LineListener"
+            android:label="我的桌面（LINE 訊息紀錄）"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
