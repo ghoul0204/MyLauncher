@@ -96,6 +96,7 @@ public class MainActivity extends Activity {
     FrameLayout root;
     LinearLayout leftList, homeGrid;
     TextView homeHint, editBtn, drawerTitle;
+    FrameLayout clockBox;
     View drawer;
     EditText drawerSearch;
     DrawerAdapter drawerAdapter;
@@ -431,13 +432,10 @@ public class MainActivity extends Activity {
         p.setOrientation(LinearLayout.VERTICAL);
         p.setPadding(dp(16), dp(24), dp(16), dp(12));
 
-        TextClock clock = new TextClock(this);
-        clock.setFormat24Hour("HH:mm");
-        clock.setFormat12Hour("h:mm");
-        clock.setTextSize(64);
-        clock.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
-        styleText(clock);
-        p.addView(clock);
+        clockBox = new FrameLayout(this);
+        clockBox.setOnClickListener(v -> chooseClockStyle());
+        p.addView(clockBox, new LinearLayout.LayoutParams(WRAP, WRAP));
+        buildClock();
 
         TextClock date = new TextClock(this);
         date.setFormat24Hour("M月d日 EEEE");
@@ -474,6 +472,38 @@ public class MainActivity extends Activity {
         });
         p.setOnTouchListener((v, e) -> gd.onTouchEvent(e));
         return p;
+    }
+
+    /** 時鐘樣式：0 = 時:分，1 = 時:分:秒，2 = 指針時鐘（含秒針）。點時鐘可切換 */
+    void buildClock() {
+        clockBox.removeAllViews();
+        int style = sp.getInt("clock_style", 1);
+        if (style == 2) {
+            AnalogClockView a = new AnalogClockView(this);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(180), dp(180));
+            lp.topMargin = dp(4);
+            lp.bottomMargin = dp(8);
+            clockBox.addView(a, lp);
+        } else {
+            TextClock clock = new TextClock(this);
+            clock.setFormat24Hour(style == 1 ? "HH:mm:ss" : "HH:mm");
+            clock.setFormat12Hour(style == 1 ? "h:mm:ss" : "h:mm");
+            clock.setTextSize(style == 1 ? 56 : 64);
+            clock.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+            clock.setFontFeatureSettings("tnum");   // 數字等寬，秒數跳動時不會左右晃
+            styleText(clock);
+            clockBox.addView(clock);
+        }
+    }
+
+    void chooseClockStyle() {
+        String[] items = {"數字（時:分）", "數字含秒（時:分:秒）", "指針時鐘（含秒針）"};
+        new AlertDialog.Builder(this, DLG).setTitle("時鐘樣式")
+                .setSingleChoiceItems(items, sp.getInt("clock_style", 1), (d, w) -> {
+                    sp.edit().putInt("clock_style", w).apply();
+                    buildClock();
+                    d.dismiss();
+                }).show();
     }
 
     void refreshHome() {
