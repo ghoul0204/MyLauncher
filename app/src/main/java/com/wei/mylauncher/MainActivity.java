@@ -3,6 +3,7 @@ package com.wei.mylauncher;
 import android.app.Activity;
 import android.app.ActivityOptions;
 import android.app.AlertDialog;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -179,6 +180,12 @@ public class MainActivity extends Activity {
         refreshLeft();
         reloadApps();
 
+        // Android 13 以上：第一次先要「發通知」權限（LINE 來電接聽按鈕要用）
+        if (Build.VERSION.SDK_INT >= 33 && !sp.getBoolean("asked_notif", false)
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            sp.edit().putBoolean("asked_notif", true).apply();
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 99);
+        }
         la.registerCallback(appsCb, new Handler(Looper.getMainLooper()));
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_MANAGED_PROFILE_ADDED);
@@ -1061,9 +1068,10 @@ public class MainActivity extends Activity {
     }
 
     void lineMenu() {
-        String[] items = {"通知存取權設定", "診斷資訊（複製給 Claude）", "清除全部 LINE 紀錄"};
+        String[] items = {"通知存取權設定", "診斷資訊（複製給 Claude）", "清除全部 LINE 紀錄", "LINE 來電接聽按鈕設定"};
         new AlertDialog.Builder(this, DLG).setItems(items, (d, w) -> {
             if (w == 0) openListenerSettings();
+            else if (w == 3) callSettings();
             else if (w == 1) {
                 StringBuilder sb = new StringBuilder();
                 synchronized (LineListener.diag) { for (String s : LineListener.diag) sb.append(s).append("\n"); }
@@ -1079,6 +1087,55 @@ public class MainActivity extends Activity {
                 new AlertDialog.Builder(this, DLG).setMessage("清除全部 LINE 紀錄？無法復原。")
                         .setPositiveButton("清除", (d2, w2) -> { LineStore.get(this).clear(); lineChat = null; refreshLeft(); })
                         .setNegativeButton("取消", null).show();
+            }
+        }).show();
+    }
+
+    /** LINE 來電接聽按鈕：開關＋需要的權限，一個畫面看狀態 */
+    void callSettings() {
+        final boolean on = sp.getBoolean("call_helper", true);
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        final boolean notif = nm != null && nm.areNotificationsEnabled();
+        final boolean full = Build.VERSION.SDK_INT < 34 || (nm != null && nm.canUseFullScreenIntent());
+        final boolean overlay = Settings.canDrawOverlays(this);
+        final boolean listen = listenerEnabled();
+        String[] items = {
+                (on ? "✅ 接聽按鈕：已開啟（點此關閉）" : "⛔ 接聽按鈕：已關閉（點此開啟）"),
+                (listen ? "✅" : "⚠️") + " 通知存取權（必要）",
+                (notif ? "✅" : "⚠️") + " 允許「我的桌面」發通知（必要）",
+                (full ? "✅" : "⚠️") + " 允許全螢幕通知（鎖定時直接跳出接聽畫面）",
+                (overlay ? "✅" : "⚠️") + " 顯示在其他 App 上層（使用中也直接跳出，建議開）",
+                "📞 測試：顯示接聽畫面"
+        };
+        new AlertDialog.Builder(this, DLG).setTitle("LINE 來電接聽按鈕").setItems(items, (d, w) -> {
+            if (w == 0) { sp.edit().putBoolean("call_helper", !on).apply(); toast(on ? "已關閉" : "已開啟"); }
+            else if (w == 1) openListenerSettings();
+            else if (w == 2) {
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                        != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 99);
+                } else {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+                    } catch (Exception ignored) { }
+                }
+            } else if (w == 3) {
+                if (Build.VERSION.SDK_INT >= 34) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                Uri.fromParts("package", getPackageName(), null)));
+                    } catch (Exception e) { toast("請到 設定 → 應用程式 → 特殊存取權 → 全螢幕通知"); }
+                }
+            } else if (w == 4) {
+                try {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.fromParts("package", getPackageName(), null)));
+                } catch (Exception ignored) { }
+            } else {
+                if (!notif && !overlay) { toast("請先允許「我的桌面」發通知"); return; }
+                LineListener.testCall(this);
+                if (!overlay) toast("把通知列拉下來看「測試來電」，或鎖定螢幕測試全螢幕");
             }
         }).show();
     }
@@ -1317,7 +1374,7 @@ public class MainActivity extends Activity {
             ArrayList<App> l = new ArrayList<>();
             boolean onlyWork = showWork && workUser != null;
             for (App a : apps)
-                if (a.work == onlyWork)
+                if (!s.isEmpty() || a.work == onlyWork)   // 有打字搜尋時：個人＋工作全部一起找
                 if (s.isEmpty() || a.label.toLowerCase(Locale.ROOT).contains(s)
                         || a.cn.getPackageName().toLowerCase(Locale.ROOT).contains(s)) l.add(a);
             shown = l;
